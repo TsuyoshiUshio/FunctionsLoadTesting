@@ -22,7 +22,7 @@ namespace FunctionsLoadTesting
 
         private static string GetDeviceId(int i)
         {
-            return $"{DEVICE_ID_HEADER}-{i.ToString("00")}";
+            return $"{DEVICE_ID_HEADER}-{i.ToString()}"; // change to fit the spamer i.ToString("00"); is better. 
         }
 
         [FunctionName("ClientStart")]
@@ -32,22 +32,13 @@ namespace FunctionsLoadTesting
             TraceWriter log)
         {
             log.Info($"Start: {DateTime.UtcNow.ToLongDateString()}");
+            dynamic eventData = await req.Content.ReadAsAsync<object>(); 
+            var instanceId = await starter.StartNewAsync("ClientOrchestrator", eventData); // eventData is not needed. However, the interface requires.
+            var result = JsonConvert.SerializeObject(new JObject {["instanceId"] = instanceId});
 
-            // 1000 client apps started
-            var instances = new List<JObject>();
-            for (int i = 0; i < 1000; i++)
-            {
-                var deviceId = GetDeviceId(i);
-                var instanceId = await starter.StartNewAsync("Client", deviceId);
-                instances.Add(JObject.Parse("{"+ $"'{deviceId}': '{instanceId}'" + "}"));
-            }
-
-            log.Info($"End: {DateTime.UtcNow.ToLongDateString()}");
-            // return the instanceIdList
-            var json = JsonConvert.SerializeObject(instances);
             return new HttpResponseMessage()
             {
-                Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
+                Content = new StringContent(result, System.Text.Encoding.UTF8, "application/text")
             };
         }
 
@@ -58,56 +49,96 @@ namespace FunctionsLoadTesting
             TraceWriter log)
         {
             var body = await req.Content.ReadAsStringAsync();
-            var restored = JsonConvert.DeserializeObject<List<JObject>>(body);
-            restored.Count();
-            foreach (var obj in restored)
-            {
-                foreach (var value in obj.Values())
-                {
-                    await terminator.TerminateAsync(value.Value<string>(), "Stop command is accepted.");
-                }
-            }
-            var result = $"{restored.Count()} clients has been terminated. -> {body}";
+            var restored = JsonConvert.DeserializeObject<JObject>(body);
+            var instanceId = restored["instanceId"].Value<string>();
+            
+            await terminator.TerminateAsync(instanceId, "Stop command fires.");
+            log.Info($"Stopped InstanceId: {instanceId}");
+            var result = JsonConvert.SerializeObject(new JObject { ["instanceId"] = $"stop {instanceId}"});
             return new HttpResponseMessage()
             {
                 Content = new StringContent(result, System.Text.Encoding.UTF8, "application/text")
             };
         }
 
+        [FunctionName("ClientStatus")]
+        public static async Task<HttpResponseMessage> ClientStatus(
+     [HttpTrigger] HttpRequestMessage req,
+     [OrchestrationClient] DurableOrchestrationClient client,
+     TraceWriter log)
+        {
+            var body = await req.Content.ReadAsStringAsync();
+            var restored = JsonConvert.DeserializeObject<JObject>(body);
+            var status = await client.GetStatusAsync(restored["instanceId"].ToString());
+
+
+            var result = $"clients status. -> {JsonConvert.SerializeObject(status)}";
+            return new HttpResponseMessage()
+            {
+                Content = new StringContent(result, System.Text.Encoding.UTF8, "application/text")
+            };
+        }
+
+        [FunctionName("ClientOrchestrator")]
+        public static async Task ClientOrchestrator(
+            [OrchestrationTrigger] DurableOrchestrationContext context)
+        {
+            const int agentNumber = 10;
+            var tasks = new Task[agentNumber];
+            for (int i = 0; i < agentNumber; i++)
+            {
+                var deviceId = GetDeviceId(i);
+                tasks[i] = context.CallActivityAsync("Client", deviceId);
+            }
+
+            await Task.WhenAll(tasks);
+        }
+
         [FunctionName("Client")]
         public static async Task ClientExec(
-            [OrchestrationTrigger] string deviceId, [Queue("que2", Connection = "connectionString")] CloudQueue queue, [Table("table", Connection = "connectionString")]CloudTable table, TraceWriter log)
+            [ActivityTrigger] string deviceId, [Queue("que2", Connection = "connectionString")] CloudQueue queue, [Table("table", Connection = "connectionString")]CloudTable table, TraceWriter log)
         {
             const int pollingInterval = 1;
+
+            log.Info($"{deviceId} has been started.");
             var TableList = new List<string>();
-            while (true)
+            try
             {
-                // check if the cancellation queue is coming.
-
-                var list = await GetListAsync(deviceId, table);
-
-                //// Loop through the results, displaying information about the entity.
-                foreach (Message entity in list)
+                while (true)
                 {
-                    if (TableList.Contains(entity.RowKey))
-                        continue;
+                    // check if the cancellation queue is coming.
 
-                    var payloadObj = Payload.FromText(entity.Text);
-                    payloadObj.InsertedIntoQ3 = DateTime.UtcNow;
-                    payloadObj.InsertIntervalAll = payloadObj.InsertedIntoQ3 - payloadObj.InsertedIntoQ1;
-                    payloadObj.InsertInterval2 = payloadObj.InsertedIntoQ3 - payloadObj.InsertedIntoQ2;
+                    var list = await GetListAsync(deviceId, table);
 
-                    JObject returnObj = new JObject() {
+                    //// Loop through the results, displaying information about the entity.
+                    foreach (Message entity in list)
+                    {
+                        if (TableList.Contains(entity.RowKey))
+                            continue;
+
+                        var payloadObj = Payload.FromText(entity.Text);
+                        payloadObj.InsertedIntoQ3 = DateTime.UtcNow;
+                        payloadObj.InsertIntervalAll = payloadObj.InsertedIntoQ3 - payloadObj.InsertedIntoQ1;
+                        payloadObj.InsertInterval2 = payloadObj.InsertedIntoQ3 - payloadObj.InsertedIntoQ2;
+
+                        JObject returnObj = new JObject() {
                         { "PartitionKey", entity.PartitionKey },
                         { "RowKey", entity.RowKey },
                         { "Text", payloadObj.ToText() },
                     };
-                    Print(entity, payloadObj);
-                    TableList.Add(entity.RowKey);
-                    await EnqueueAsync(queue, returnObj.ToString());
-                }
+                        Print(entity, payloadObj);
+                        TableList.Add(entity.RowKey);
+                        await EnqueueAsync(queue, returnObj.ToString());
+                    }
 
-                await Task.Delay(TimeSpan.FromSeconds(pollingInterval));
+                    await Task.Delay(TimeSpan.FromSeconds(pollingInterval));
+                }
+            } catch (Exception e)
+            {
+                log.Error($"Client Error Happens. {e.Message}", e);
+            } finally
+            {
+                log.Info($"{deviceId} has been finished.");
             }
 
 

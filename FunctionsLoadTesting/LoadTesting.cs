@@ -44,7 +44,11 @@ namespace FunctionsLoadTesting
 
             log.Info($"End: {DateTime.UtcNow.ToLongDateString()}");
             // return the instanceIdList
-            return req.CreateResponse(HttpStatusCode.OK, JsonConvert.SerializeObject(instances));
+            var json = JsonConvert.SerializeObject(instances);
+            return new HttpResponseMessage()
+            {
+                Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
+            };
         }
 
         [FunctionName("ClientStop")]
@@ -63,7 +67,11 @@ namespace FunctionsLoadTesting
                     await terminator.TerminateAsync(value.Value<string>(), "Stop command is accepted.");
                 }
             }
-            return req.CreateResponse($"{restored.Count()} clients has been terminated. -> {body}");
+            var result = $"{restored.Count()} clients has been terminated. -> {body}";
+            return new HttpResponseMessage()
+            {
+                Content = new StringContent(result, System.Text.Encoding.UTF8, "application/text")
+            };
         }
 
         [FunctionName("Client")]

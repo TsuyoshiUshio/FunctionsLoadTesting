@@ -11,6 +11,8 @@ using Microsoft.WindowsAzure.Storage.Queue;
 using Microsoft.WindowsAzure.Storage.Table;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using System.Configuration;
+using Microsoft.WindowsAzure.Storage;
 
 namespace FunctionsLoadTesting
 {
@@ -33,7 +35,7 @@ namespace FunctionsLoadTesting
         {
             log.Info($"Start: {DateTime.UtcNow.ToLongDateString()}");
             dynamic eventData = await req.Content.ReadAsAsync<object>(); 
-            var instanceId = await starter.StartNewAsync("ClientOrchestrator", eventData); // eventData is not needed. However, the interface requires.
+            var instanceId = await starter.StartNewAsync("AgentExpansionOrchestrator", eventData); // eventData is not needed. However, the interface requires.
             var result = JsonConvert.SerializeObject(new JObject {["instanceId"] = instanceId});
 
             return new HttpResponseMessage()
@@ -83,15 +85,122 @@ namespace FunctionsLoadTesting
         public static async Task ClientOrchestrator(
             [OrchestrationTrigger] DurableOrchestrationContext context)
         {
-            const int agentNumber = 10;
+            const int agentNumber = 100;
             var tasks = new Task[agentNumber];
             for (int i = 0; i < agentNumber; i++)
             {
                 var deviceId = GetDeviceId(i);
-                tasks[i] = context.CallActivityAsync("Client", deviceId);
+                tasks[i] = context.CallActivityWithRetryAsync("Client", new RetryOptions(TimeSpan.FromSeconds(1) ,int.MaxValue), deviceId);
             }
 
             await Task.WhenAll(tasks);
+        }
+
+        [FunctionName("AgentExpansionOrchestrator")]
+        public static async Task AgentExpansionOrchestrator(
+    [OrchestrationTrigger] DurableOrchestrationContext context
+    )
+        {
+            const int agentNumber = 10;
+            var agentOrchestrators = Enumerable.Range(0, agentNumber)
+                .Select(x => new AgentRequest { DeviceId = GetDeviceId(x), Id = x, PrintedMessages = Array.Empty<Message>(), ProcessedRowKeys = new Dictionary<int, List<string>>() })
+                .Select(request => context.CallSubOrchestratorAsync("AgentOrchestrator", request))
+                ;
+
+            await Task.WhenAll(agentOrchestrators);
+        }
+
+        [FunctionName("AgentOrchestrator")]
+        public static async Task AgentOrchestrator([OrchestrationTrigger] DurableOrchestrationContext context)
+        {
+            var agentRequest = context.GetInput<AgentRequest>();
+
+            agentRequest = await context.CallActivityAsync<AgentRequest>("AgentActivity", agentRequest);
+
+
+           // await Task.Delay(TimeSpan.FromSeconds(1));
+            context.ContinueAsNew(agentRequest);
+        }
+
+        public class AgentRequest
+        {
+            public Message[] PrintedMessages { get; set; }
+
+            public string DeviceId { get; set; }
+
+            public int Id { get; set; }
+
+            public Dictionary<int, List<string>> ProcessedRowKeys { get; set;}
+        }
+
+        private static async Task<List<string>> executeAgent(List<string> processedRowKeys, int i)
+        {
+            var connectionString = ConfigurationManager.AppSettings.Get("connectionString");
+            var storageAccount = CloudStorageAccount.Parse(connectionString);
+            var tableClient = storageAccount.CreateCloudTableClient();
+            var queueClient = storageAccount.CreateCloudQueueClient();
+            var table = tableClient.GetTableReference("table");
+            var queue = queueClient.GetQueueReference("que2");
+
+            var list = await GetListAsync(GetDeviceId(i), table);
+            var result = new List<Message>();
+             //// Loop through the results, displaying information about the entity.
+            foreach (Message entity in list)
+            {
+                if (processedRowKeys.Contains(entity.RowKey))
+                    continue;
+
+                var payloadObj = Payload.FromText(entity.Text);
+                payloadObj.InsertedIntoQ3 = DateTime.UtcNow;
+                payloadObj.InsertIntervalAll = payloadObj.InsertedIntoQ3 - payloadObj.InsertedIntoQ1;
+                payloadObj.InsertInterval2 = payloadObj.InsertedIntoQ3 - payloadObj.InsertedIntoQ2;
+
+                JObject returnObj = new JObject() {
+                        { "PartitionKey", entity.PartitionKey },
+                        { "RowKey", entity.RowKey },
+                        { "Text", payloadObj.ToText() },
+                    };
+                Print(entity, payloadObj);
+                processedRowKeys.Add(entity.RowKey);
+                await EnqueueAsync(queue, returnObj.ToString());
+            }
+            return processedRowKeys;
+        }
+
+        [FunctionName("AgentActivity")]
+        public static async Task<AgentRequest> AgentActivity(
+            [ActivityTrigger] AgentRequest request,
+             TraceWriter log)
+        {
+            const int concurentNumber = 100;
+            var tasks = new Task<List<string>>[concurentNumber];
+            var rowKeys = request.ProcessedRowKeys;
+            foreach (var i in Enumerable.Range(request.Id * concurentNumber, concurentNumber))
+            {
+                var index = i - (request.Id * concurentNumber);
+                if (rowKeys.ContainsKey(index))
+                {
+                    tasks[index] = executeAgent(request.ProcessedRowKeys[index], i);
+                } else
+                {
+                    tasks[index] = executeAgent(new List<string>(), i);
+                }
+            }
+            await Task.WhenAll(tasks);
+            
+            foreach (var i in Enumerable.Range(0, concurentNumber))
+            {
+                if (rowKeys.ContainsKey(i))
+                {
+                    rowKeys[i] = await tasks[i];
+                } else
+                {
+                    rowKeys.Add(i, await tasks[i]);
+                }
+
+            }
+            request.ProcessedRowKeys = rowKeys;
+            return request;
         }
 
         [FunctionName("Client")]
@@ -109,6 +218,8 @@ namespace FunctionsLoadTesting
                     // check if the cancellation queue is coming.
 
                     var list = await GetListAsync(deviceId, table);
+
+
 
                     //// Loop through the results, displaying information about the entity.
                     foreach (Message entity in list)
@@ -129,9 +240,10 @@ namespace FunctionsLoadTesting
                         Print(entity, payloadObj);
                         TableList.Add(entity.RowKey);
                         await EnqueueAsync(queue, returnObj.ToString());
+                       
                     }
 
-                    await Task.Delay(TimeSpan.FromSeconds(pollingInterval));
+                      await Task.Delay(TimeSpan.FromSeconds(pollingInterval));
                 }
             } catch (Exception e)
             {
